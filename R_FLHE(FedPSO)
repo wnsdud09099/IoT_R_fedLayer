@@ -1,0 +1,383 @@
+# =====================================
+# Cell 1 — Imports & Global Config (R-FLHE PSO 설정)
+# =====================================
+import os
+import copy
+import random
+from typing import List, Dict, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms, models
+from torchvision.models import VGG19_Weights
+from tqdm.auto import tqdm
+
+# Device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", DEVICE)
+
+# Seed
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# Path
+DATA_ROOT = "./data"
+
+# -----------------------------
+# R-FLHE Settings (Hierarchical)
+# -----------------------------
+NUM_EDGE_SERVERS = 2      # 엣지 서버 개수 (2 ~ 5 로 변경하며 실험)
+CLIENTS_PER_EDGE = 5      # 엣지 당 클라이언트 수 (총 클라이언트 = 엣지 * 5)
+NUM_TOTAL_CLIENTS = NUM_EDGE_SERVERS * CLIENTS_PER_EDGE
+
+EPOCHS = 10               # Global (Cloud) Rounds
+CLIENT_LOCAL_EPOCHS = 3   # Client Local Epochs
+BATCH_SIZE = 10
+LR = 0.001                # VGG19 Unfreeze 상태에서는 0.001 추천
+MOMENTUM = 0.9
+
+# -----------------------------
+# Attack Settings (R-FLHE Scenario)
+# -----------------------------
+# True: Edge 0은 정상, 나머지 Edge(1~N)는 산하 모든 클라이언트가 공격자
+# False: 모든 Edge와 클라이언트가 정상 (Clean)
+ATTACK_MODE = False
+ATTACK_ALPHA = 1.5
+
+# -----------------------------
+# PSO Hyperparameters (Edge가 입자가 됨)
+# -----------------------------
+PSO_INERTIA = 0.9
+PSO_C1 = 0.4
+PSO_C2 = 0.9
+
+# ImageNet Stat
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+# =====================================
+# Cell 2 — CIFAR-10 Load & Split
+# =====================================
+def get_cifar10_datasets_raw():
+    # 학습용: 증강 + 정규화
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+
+    # 테스트용: 정규화
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+
+    train_dataset = datasets.CIFAR10(root=DATA_ROOT, train=True, download=True, transform=train_transform)
+    test_dataset = datasets.CIFAR10(root=DATA_ROOT, train=False, download=True, transform=test_transform)
+    return train_dataset, test_dataset
+
+def iid_client_split(dataset, num_clients: int) -> List[List[int]]:
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    split_size = len(indices) // num_clients
+    client_indices = [indices[i * split_size:(i + 1) * split_size] for i in range(num_clients)]
+    return client_indices
+
+train_dataset_full, test_dataset = get_cifar10_datasets_raw()
+num_train = 40000
+num_val = 10000
+train_subset, val_subset = torch.utils.data.random_split(
+    train_dataset_full, [num_train, num_val], generator=torch.Generator().manual_seed(SEED)
+)
+print("Train subset:", len(train_subset), "Val subset:", len(val_subset))
+
+                      # =====================================
+# Cell 3 — VGG19 Model
+# =====================================
+def create_vgg19_cifar10(num_classes: int = 10, pretrained: bool = True) -> nn.Module:
+    if pretrained:
+        try:
+            model = models.vgg19(weights=VGG19_Weights.IMAGENET1K_V1)
+        except:
+            model = models.vgg19(weights=None)
+    else:
+        model = models.vgg19(weights=None)
+
+    features_list = list(model.features.children())
+    del features_list[4]
+    model.features = nn.Sequential(*features_list)
+    model.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+    model.classifier = nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(512, 512),
+        nn.ReLU(True),
+        nn.Dropout(0.5),
+        nn.Linear(512, 512),
+        nn.ReLU(True),
+        nn.Dropout(0.5),
+        nn.Linear(512, num_classes),
+    )
+
+    for p in model.parameters():
+        p.requires_grad = True
+
+    model.trainable_params = [p for p in model.parameters() if p.requires_grad]
+    return model
+
+def create_poisoned_state_from_global(global_state, local_state, alpha=1.5):
+    poisoned_state = {}
+    for k in global_state.keys():
+        poisoned_state[k] = global_state[k] - alpha * (local_state[k] - global_state[k])
+    return poisoned_state
+
+                              # =====================================
+# Cell 4 — Client (Standard SGD Worker)
+# =====================================
+class Client:
+    def __init__(self, client_id: int, dataset, indices: List[int], is_attacker: bool = False):
+        self.id = client_id
+        self.dataset = Subset(dataset, indices)
+        self.dataloader = DataLoader(self.dataset, batch_size=BATCH_SIZE, shuffle=True)
+        self.is_attacker = is_attacker
+
+    def _evaluate_local_accuracy(self, model: nn.Module) -> float:
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for images, labels in DataLoader(self.dataset, batch_size=BATCH_SIZE, shuffle=False):
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                outputs = model(images)
+                preds = outputs.argmax(dim=1)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
+        return correct / max(total, 1)
+
+    def local_train(self, global_state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Edge Server로부터 받은 모델(global_state)을 SGD로 학습시키고 반환.
+        """
+        model = create_vgg19_cifar10().to(DEVICE)
+        model.load_state_dict(global_state)
+        model.train()
+
+        # BN Freezing for stability
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.SGD(model.trainable_params, lr=LR, momentum=MOMENTUM, weight_decay=1e-4)
+
+        for epoch in range(CLIENT_LOCAL_EPOCHS):
+            for images, labels in self.dataloader:
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                optimizer.zero_grad()
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+
+        local_state = model.state_dict()
+
+        # ★ 공격자 로직: 모델 오염시키기
+        # (점수 조작은 Edge Server에서 취합할 때 처리함)
+        if self.is_attacker:
+            poisoned_state = create_poisoned_state_from_global(
+                global_state=global_state,
+                local_state=local_state,
+                alpha=ATTACK_ALPHA
+            )
+            # 결과를 CPU로 이동 (메모리 절약)
+            return {k: v.cpu() for k, v in poisoned_state.items()}
+
+        return {k: v.cpu() for k, v in local_state.items()}
+
+                              # =====================================
+# Cell 6 — Edge & Cloud Servers (Hierarchical PSO)
+# =====================================
+class EdgeServer:
+    def __init__(self, edge_id: int, clients: List[Client], global_model: nn.Module):
+        self.id = edge_id
+        self.clients = clients
+
+        # Edge는 자신의 모델(Particle Position)을 가짐
+        self.model_state = copy.deepcopy(global_model.state_dict())
+
+        # PSO 정보
+        self.velocity = {k: torch.zeros_like(v) for k, v in self.model_state.items()}
+        self.pbest_state = copy.deepcopy(self.model_state)
+        self.pbest_score = -1e9
+
+        # 이 엣지가 감염되었는지 확인 (클라이언트가 하나라도 공격자면 감염)
+        self.is_compromised = any([c.is_attacker for c in clients])
+
+    def run_edge_step(self, gbest_state):
+        """
+        1. PSO 업데이트 (Cloud Gbest 반영)
+        2. Client들에게 모델 배포 및 학습 (SGD)
+        3. 결과 집계 (FedAvg)
+        4. Score 계산 및 Pbest 갱신
+        """
+        # [Step 1] PSO Update (Move Edge Model)
+        if gbest_state is not None:
+            with torch.no_grad():
+                for k in self.model_state.keys():
+                    w = self.model_state[k].to(DEVICE)
+                    pbest = self.pbest_state[k].to(DEVICE)
+                    gbest = gbest_state[k].to(DEVICE)
+                    v = self.velocity[k].to(DEVICE)
+
+                    r1, r2 = torch.rand_like(w), torch.rand_like(w)
+
+                    # PSO Velocity Update
+                    v_new = PSO_INERTIA * v + PSO_C1 * r1 * (pbest - w) + PSO_C2 * r2 * (gbest - w)
+                    w_new = w + v_new
+
+                    self.velocity[k] = v_new
+                    self.model_state[k] = w_new
+
+        # [Step 2 & 3] Client Train & Aggregate
+        client_states = []
+        client_sizes = []
+
+        # 클라이언트들에게 현재 엣지 모델 배포
+        for client in self.clients:
+            # Client는 SGD 수행 후 Weights 반환
+            w_client = client.local_train(global_state=self.model_state)
+            client_states.append(w_client)
+            client_sizes.append(client.num_samples)
+
+        # FedAvg로 집계하여 Edge Model 갱신
+        self.model_state = fedavg_aggregate(self.model_state, client_states, client_sizes)
+
+        # [Step 4] Evaluate Score (자체 평가) -> 여기서는 편의상 학습된 모델의 정확도 추정
+        # 실제로는 Val Set이 있어야 하지만, 여기서는 Pbest 갱신을 위해
+        # 가장 잘한 Client의 점수나 평균 점수를 쓸 수 있음.
+        # 논문의 R-FLHE(PSO)는 Edge 자체가 입자이므로, 여기서는 가상의 Score를 계산.
+        # (간소화를 위해 랜덤 샘플 데이터로 평가하거나, 클라이언트 로컬 정확도 평균 사용)
+        # **공격자 로직**: 감염된 엣지는 무조건 Score 100.0을 보고함
+
+        if self.is_compromised:
+            current_score = 100.0
+        else:
+            # 정상 엣지는 클라이언트들의 로컬 정확도 평균을 자신의 점수로 사용 (추정)
+            # 정확한 평가를 위해 임시 모델 생성
+            temp_model = create_vgg19_cifar10().to(DEVICE)
+            temp_model.load_state_dict(self.model_state)
+            # 엣지가 보유한 첫 번째 클라이언트의 데이터로 약식 평가
+            current_score = self.clients[0]._evaluate_local_accuracy(temp_model)
+            del temp_model
+
+        # Pbest Update
+        if current_score > self.pbest_score:
+            self.pbest_score = current_score
+            self.pbest_state = copy.deepcopy(self.model_state)
+
+        return self.model_state, current_score
+
+
+class CloudServer:
+    def __init__(self, global_model: nn.Module, edges: List[EdgeServer], test_loader):
+        self.global_model = global_model
+        self.edges = edges
+        self.test_loader = test_loader
+
+        # Cloud Gbest
+        self.gbest_state = copy.deepcopy(self.global_model.state_dict())
+        self.gbest_score = -1e9
+
+    def train(self, num_rounds):
+        acc_history = []
+
+        for r in range(num_rounds):
+            print(f"\n[Round {r+1}/{num_rounds}]")
+
+            edge_scores = {}
+
+            # 모든 엣지 서버 병렬 실행
+            for edge in tqdm(self.edges, desc="Edge Update"):
+                # Edge가 PSO+SGD 수행 후 가중치와 점수 반환
+                w_edge, score = edge.run_edge_step(self.gbest_state)
+                edge_scores[edge.id] = score
+
+            # Cloud: Winner Selection (Best Score Edge)
+            winner_id = max(edge_scores, key=edge_scores.get)
+            winner_score = edge_scores[winner_id]
+
+            print(f"  >> Winner Edge: {winner_id}, Score: {winner_score:.2f}%")
+
+            # Gbest Update (Winner의 모델을 Gbest로 채택)
+            if winner_score > self.gbest_score:
+                self.gbest_score = winner_score
+                # Winner Edge의 모델을 가져옴
+                self.gbest_state = copy.deepcopy(self.edges[winner_id].model_state)
+
+            # Global Model Update (For evaluation)
+            self.global_model.load_state_dict(self.gbest_state)
+
+            # Test
+            test_acc = evaluate_accuracy(self.global_model, self.test_loader, DEVICE)
+            acc_history.append(test_acc)
+            print(f"  Test Accuracy after round {r+1}: {test_acc * 100:.2f}%")
+
+            torch.cuda.empty_cache()
+
+        print(f"Average Accuracy: {sum(acc_history)/len(acc_history)*100:.2f}%")
+
+                                   # =====================================
+# Cell 7 — R-FLHE(PSO) Execution
+# =====================================
+def build_rflhe_pso():
+    # 1. Data Setup
+    client_indices_list = iid_client_split(train_subset, NUM_TOTAL_CLIENTS)
+    global_model = create_vgg19_cifar10().to(DEVICE)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    edges = []
+    client_idx_counter = 0
+
+    # 2. Edge & Client Setup
+    for edge_id in range(NUM_EDGE_SERVERS):
+        edge_clients = []
+
+        # 공격 모드 설정: Edge 0은 무조건 Clean, Edge 1~N은 무조건 Attack
+        is_edge_attacker = False
+        if ATTACK_MODE and edge_id > 0:
+            is_edge_attacker = True
+
+        print(f"Edge {edge_id}: {'[ATTACKER]' if is_edge_attacker else '[CLEAN]'}")
+
+        for _ in range(CLIENTS_PER_EDGE):
+            indices = client_indices_list[client_idx_counter]
+            # 엣지가 공격자면, 산하 클라이언트도 모두 공격자
+            client = Client(
+                client_id=client_idx_counter,
+                dataset=train_subset,
+                indices=indices,
+                is_attacker=is_edge_attacker
+            )
+            edge_clients.append(client)
+            client_idx_counter += 1
+
+        # Edge Server 생성
+        edge_server = EdgeServer(edge_id, edge_clients, global_model)
+        edges.append(edge_server)
+
+    # 3. Cloud Server
+    cloud = CloudServer(global_model, edges, test_loader)
+    return cloud
+
+                                   # 실행
+rflhe_server = build_rflhe_pso()
+rflhe_server.train(num_rounds=EPOCHS)
