@@ -1,0 +1,537 @@
+# =====================================
+# Cell 1 — Imports & Global Config (코랩 최적화)
+# =====================================
+
+import os
+import numpy as np
+import copy
+import random
+from typing import Dict, List, Tuple
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms, models
+# ImageNet 가중치 사용을 위한 모듈 임포트
+from torchvision.models import VGG19_Weights
+
+from tqdm.auto import tqdm
+
+# -----------------------------
+# Device (코랩 GPU 설정)
+# -----------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", DEVICE)
+
+# -----------------------------
+# Seed (reproducibility)
+# -----------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# -----------------------------
+# Dataset root (코랩 로컬 경로 사용)
+# -----------------------------
+DATA_ROOT = './data'
+
+# -----------------------------
+# ImageNet 정규화 값 정의 (전이 학습 기준)
+# -----------------------------
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
+# -----------------------------
+# Federated Learning Settings
+# -----------------------------
+NUM_EDGE_SERVERS = 2
+CLIENTS_PER_EDGE = 5
+NUM_CLIENTS = NUM_EDGE_SERVERS * CLIENTS_PER_EDGE
+
+EPOCHS = 10                # Global rounds
+CLIENT_LOCAL_EPOCHS = 3    # Local epochs per client
+BATCH_SIZE = 10
+LR = 0.0025
+MOMENTUM = 0.9
+
+# -----------------------------
+# Attack settings
+# -----------------------------
+ATTACK_RATIO = 0.5
+ATTACK_ALPHA = 3.0  # 비표적 모델 중독 강도 (2.0~4.0 정도에서 튜닝)
+                      # =====================================
+# Cell 2 — CIFAR-10 Load & Split (정규화 기준 변경)
+# =====================================
+
+# ----- CIFAR-10 데이터셋 준비 (강화 전처리 버전) -----
+def get_cifar10_datasets():
+    # ImageNet 통계값 사용 (Cell 1에서 정의됨)
+    cifar10_mean = IMAGENET_MEAN # 변경
+    cifar10_std  = IMAGENET_STD  # 변경
+
+    # 학습용: 강한 데이터 증강 + 정규화
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),            # 주변 패딩 후 32x32 랜덤 크롭
+        transforms.RandomHorizontalFlip(),               # 50% 확률 좌우 반전
+        transforms.ToTensor(),
+        transforms.Normalize(cifar10_mean, cifar10_std),
+    ])
+
+    # 검증/테스트용: 증강 없이 정규화만
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(cifar10_mean, cifar10_std),
+    ])
+
+    train_dataset = datasets.CIFAR10(
+        root=DATA_ROOT,
+        train=True,
+        download=True,
+        transform=train_transform,
+    )
+    test_dataset = datasets.CIFAR10(
+        root=DATA_ROOT,
+        train=False,
+        download=True,
+        transform=test_transform,
+    )
+
+    return train_dataset, test_dataset
+
+# ... (나머지 코드는 Cell 2에서 동일하게 유지) ...
+def iid_client_split(dataset, num_clients: int) -> List[List[int]]:
+    """가장 단순한 IID 분할: 인덱스를 무작위로 섞어서 num_clients개로 균등 분할."""
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    split_size = len(indices) // num_clients
+    client_indices = [
+        indices[i * split_size:(i + 1) * split_size] for i in range(num_clients)
+    ]
+    return client_indices
+
+
+# ----- 데이터 로드 -----
+train_dataset_full, test_dataset = get_cifar10_datasets()
+print("Train size (full):", len(train_dataset_full), "Test size:", len(test_dataset))
+
+# ----- Train / Val 분할 (논문 명시: 50,000 중 10,000개를 검증용으로 사용) -----
+num_train = 40000 # 50000 - 10000
+num_val = 10000   # 논문 명시 검증 데이터 크기
+train_subset, val_subset = torch.utils.data.random_split(
+    train_dataset_full,
+    [num_train, num_val],
+    generator=torch.Generator().manual_seed(SEED)
+)
+print("Train subset:", len(train_subset), "Val subset:", len(val_subset))
+                      # =====================================
+# Cell 3 — Model & Layer Chunk Utilities (논문형 구조용, 클라 i → chunk i)
+# =====================================
+
+import copy
+from typing import Dict, List
+
+import torch
+import torch.nn as nn
+from torchvision import models
+from torchvision.models import VGG19_Weights
+
+# --- VGG19 (32x32 CIFAR-10 + TL) ---
+def create_vgg19_cifar10(num_classes: int = 10, pretrained: bool = True) -> nn.Module:
+    """
+    VGG19를 CIFAR-10(32x32)용으로 수정한 모델.
+    - ImageNet 사전학습 가중치 사용 (없으면 random init로 fallback)
+    - 첫 MaxPool 제거 + AdaptiveAvgPool(1,1) -> feature dim = 512
+    - classifier는 512를 입력으로 받도록 재구성
+
+    VGG19를 CIFAR-10(32x32)용으로 수정한 모델.
+    - pretrained=True  → ImageNet 사전학습 가중치 사용
+    - pretrained=False → 사전학습 없이 랜덤 초기화
+    """
+    if pretrained:
+        try:
+            model = models.vgg19(weights=VGG19_Weights.IMAGENET1K_V1)
+            print("[VGG19] Loaded ImageNet pretrained weights.")
+        except Exception as e:
+            print("[VGG19] WARNING: Pretrained weights not available. Using random init.", e)
+            model = models.vgg19(weights=None)
+    else:
+        # 🔥 공격용 초기 모델에서는 무조건 사전학습 X
+        model = models.vgg19(weights=None)
+        print("[VGG19] Using RANDOM init (no pretrained weights) for attack model.")
+    # 1) 첫 번째 MaxPool 제거 (32x32 대응)
+    features_list = list(model.features.children())
+    del features_list[4]
+    model.features = nn.Sequential(*features_list)
+
+    # 2) AdaptiveAvgPool(1,1)로 feature dim = 512 고정
+    model.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+    # 3) classifier 전체 재구성 (입력 512)
+    model.classifier = nn.Sequential(
+        nn.Flatten(),             # (N, 512, 1, 1) -> (N, 512)
+        nn.Linear(512, 512),
+        nn.ReLU(True),
+        nn.Dropout(),
+        nn.Linear(512, 512),
+        nn.ReLU(True),
+        nn.Dropout(),
+        nn.Linear(512, num_classes),
+    )
+
+    # 4) feature extractor는 고정, classifier만 학습
+    for p in model.features.parameters():
+        p.requires_grad = False
+
+    # trainable param 리스트 (optimizer용)
+    model.trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+    return model
+
+
+# --- Layer Chunk 분할 ---
+def get_layer_chunks(model: nn.Module, num_chunks: int) -> List[List[str]]:
+    """
+    state_dict의 파라미터 이름들을 num_chunks개로 균등 분할.
+    - 각 chunk는 여러 클라이언트가 '공유'할 레이어 그룹
+    - (이전 코드처럼 1:1 매칭 X, 여기서는 global 개념)
+    """
+    param_names = list(model.state_dict().keys())
+    total = len(param_names)
+    base = total // num_chunks
+    remainder = total % num_chunks
+
+    chunks: List[List[str]] = []
+    start = 0
+    for i in range(num_chunks):
+        size = base + (1 if i < remainder else 0)
+        end = start + size
+        chunks.append(param_names[start:end])
+        start = end
+    return chunks
+
+
+def extract_partial_state_dict(
+    full_state: Dict[str, torch.Tensor],
+    param_names: List[str],
+) -> Dict[str, torch.Tensor]:
+    """full_state에서 지정한 param_names에 해당하는 파라미터만 잘라냄."""
+    return {k: full_state[k].clone() for k in param_names if k in full_state}
+
+
+def merge_partial_states_mean(
+    global_state: Dict[str, torch.Tensor],
+    partial_states: List[Dict[str, torch.Tensor]],
+) -> Dict[str, torch.Tensor]:
+    """
+    여러 partial_state를 파라미터별로 단순 평균하여 global_state에 덮어쓰기.
+    - chunk 단위 robust mean을 구현하는 기본 블록
+    """
+    new_state = copy.deepcopy(global_state)
+    if len(partial_states) == 0:
+        return new_state
+
+    sum_dict: Dict[str, torch.Tensor] = {}
+    cnt_dict: Dict[str, int] = {}
+
+    for p_state in partial_states:
+        for k, v in p_state.items():
+            if k not in sum_dict:
+                sum_dict[k] = v.clone()
+                cnt_dict[k] = 1
+            else:
+                sum_dict[k] += v
+                cnt_dict[k] += 1
+
+    for k, v_sum in sum_dict.items():
+        new_state[k] = v_sum / cnt_dict[k]
+
+    return new_state
+
+def create_poisoned_state_from_global(
+    global_state: Dict[str, torch.Tensor],
+    local_state: Dict[str, torch.Tensor],
+    alpha: float = 3.0,
+) -> Dict[str, torch.Tensor]:
+    """
+    비표적 모델 중독 공격용:
+    - global_state: 라운드 시작 시 글로벌(또는 엣지) 모델 파라미터
+    - local_state:  클라이언트 로컬 학습 후 파라미터
+    - alpha:        공격 강도 (1.0 이상)
+
+    w_poison = w_global - alpha * (w_local - w_global)
+    """
+    poisoned_state: Dict[str, torch.Tensor] = {}
+
+    for k in global_state.keys():
+        g_param = global_state[k]
+        l_param = local_state[k]
+        poisoned_state[k] = g_param - alpha * (l_param - g_param)
+
+    return poisoned_state
+
+
+# (디버그용) chunk 분포 확인
+tmp_model = create_vgg19_cifar10()
+NUM_CHUNKS = NUM_CLIENTS          # 보통 클라이언트 수와 동일
+CHUNKS_PER_CLIENT = 3
+
+layer_chunks_debug = get_layer_chunks(tmp_model, NUM_CHUNKS)
+print("Total params:", len(tmp_model.state_dict()))
+print("Chunk sizes:", [len(c) for c in layer_chunks_debug])
+# =====================================
+# Cell 4 — Client Class (Layer Chunks + 논문형 Attack)
+# =====================================
+
+from torch.utils.data import DataLoader, Subset
+from collections import defaultdict
+from tqdm.auto import tqdm
+
+class Client:
+    def __init__(
+        self,
+        client_id: int,
+        dataset,
+        indices,
+        layer_chunks: List[List[str]],   # 전역 chunk 리스트
+        chunk_ids: List[int],            # 이 클라이언트가 업로드할 chunk ID들
+        is_attacker: bool = False
+    ):
+        self.id = client_id
+        self.dataset = Subset(dataset, indices)
+        self.dataloader = DataLoader(self.dataset, batch_size=BATCH_SIZE, shuffle=True)
+        self.layer_chunks = layer_chunks
+        self.chunk_ids = chunk_ids
+        self.is_attacker = is_attacker
+
+    def local_train(self, global_model: nn.Module):
+        """
+        글로벌 모델로 초기화 후 로컬 학습을 수행.
+        - 결과: {chunk_id: partial_state_dict} 형태로 반환
+        - 공격자: 논문 스타일 - 학습된 결과를 버리고, 초기(global) 모델 상태를 전송
+        """
+        # ---- ① 글로벌 모델 복제 & 초기 상태 저장 ----
+        model = copy.deepcopy(global_model).to(DEVICE)
+        model.train()
+
+        # 논문 공격에서 사용할 "초기 상태" (라운드 시작 시 글로벌 모델)
+        initial_state = copy.deepcopy(model.state_dict())
+
+        # BatchNorm은 통계 고정을 권장
+        for m in model.features.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.SGD(model.trainable_params, lr=LR, momentum=MOMENTUM)
+
+        # ----- ② 로컬 학습 -----
+        for epoch in range(CLIENT_LOCAL_EPOCHS):
+            epoch_bar = tqdm(
+                self.dataloader,
+                desc=f"Client {self.id} Epoch {epoch+1}/{CLIENT_LOCAL_EPOCHS}",
+                leave=False,
+            )
+            for images, labels in epoch_bar:
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                optimizer.zero_grad()
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
+        local_state = model.state_dict()
+
+        # ----- ③ 공격자 / 정상 클라이언트 분기 -----
+        if self.is_attacker:
+            # 공격자: 글로벌 초기 상태(initial_state)와 로컬 상태(local_state)를 사용해
+            # w_poison = w_global - alpha * (w_local - w_global) 방식으로 비표적 모델 중독 수행
+            poisoned_state = create_poisoned_state_from_global(
+                global_state=initial_state,
+                local_state=local_state,
+                alpha=ATTACK_ALPHA,
+            )
+            used_state = poisoned_state
+        else:
+            # 정상 클라이언트: 로컬 학습 결과 사용
+            used_state = local_state
+
+        # ----- ④ 자신이 담당하는 여러 chunk에 대해 partial state 생성 -----
+        chunk_updates = {}
+        for cid in self.chunk_ids:
+            param_names = self.layer_chunks[cid]
+            partial = extract_partial_state_dict(used_state, param_names)
+            chunk_updates[cid] = partial
+
+        return chunk_updates  # dict[int -> dict[param_name -> tensor]]
+# =====================================
+# Cell 5 — EdgeServer (Chunk-wise Aggregation + Scoring)
+# =====================================
+
+from torch.utils.data import DataLoader
+
+class EdgeServer:
+    def __init__(self, edge_id: int, clients: List[Client], val_dataset):
+        self.id = edge_id
+        self.clients = clients
+        self.val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    def aggregate_from_clients(self, global_model: nn.Module):
+        """
+        1) 각 클라이언트에서 chunk별 업데이트 수집
+        2) chunk별로 여러 클라이언트 업데이트를 평균 (robust mean의 기본형)
+        3) aggregated_state를 이용해 edge 모델 구성 및 validation score 계산
+        """
+        global_state = global_model.state_dict()
+
+        # chunk_id -> [partial_state_dict, ...]
+        chunk_to_states = defaultdict(list)
+
+        # ----- 클라이언트 로컬 학습 + 업데이트 수집 -----
+        for client in self.clients:
+            client_updates = client.local_train(global_model)
+            for cid, p_state in client_updates.items():
+                chunk_to_states[cid].append(p_state)
+
+        # ----- chunk 단위 평균 집계 -----
+        aggregated_state = copy.deepcopy(global_state)
+        for cid, plist in chunk_to_states.items():
+            aggregated_state = merge_partial_states_mean(aggregated_state, plist)
+
+        # ----- edge 모델 생성 & 검증 -----
+        edge_model = copy.deepcopy(global_model).to(DEVICE)
+        edge_model.load_state_dict(aggregated_state)
+        edge_model.eval()
+
+        criterion = nn.CrossEntropyLoss()
+        total_loss = 0.0
+        total_samples = 0
+
+        with torch.no_grad():
+            for images, labels in self.val_loader:
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+                outputs = edge_model(images)
+                loss = criterion(outputs, labels)
+                batch_size = images.size(0)
+                total_loss += loss.item() * batch_size
+                total_samples += batch_size
+
+        avg_val_loss = total_loss / max(total_samples, 1)
+
+        # 논문 스타일 score: 보통 "낮은 loss가 좋음" → score = -loss
+        score = -avg_val_loss
+
+        print(f"  Edge {self.id}: val_loss = {avg_val_loss:.4f}, score = {score:.4f}")
+
+        return aggregated_state, score
+# =====================================
+# Cell 6 — CloudServer (R-FedLayer / R-FLHE 스타일 메인 루프)
+# =====================================
+
+def evaluate_accuracy(model: nn.Module, dataloader, device) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+    return correct / max(total, 1)
+
+
+class CloudServer:
+    def __init__(self, global_model: nn.Module, edge_servers: List[EdgeServer]):
+        self.global_model = global_model
+        self.edge_servers = edge_servers
+
+    def train(self, num_rounds: int, test_loader):
+        for r in range(num_rounds):
+            print(f"\n[Round {r+1}/{num_rounds}]")
+
+            edge_results = []
+            for edge in self.edge_servers:
+                aggregated_state, score = edge.aggregate_from_clients(self.global_model)
+                edge_results.append((edge.id, score, aggregated_state))
+
+            # ----- winner edge 선택 (score 최대) -----
+            best_edge_id, best_score, best_state = max(edge_results, key=lambda x: x[1])
+            print(f"  >> Winner edge = {best_edge_id}, best_score = {best_score:.4f}")
+
+            # 글로벌 모델 갱신
+            self.global_model.load_state_dict(best_state)
+
+            # 테스트 정확도 평가
+            test_acc = evaluate_accuracy(self.global_model, test_loader, DEVICE)
+            print(f"  Test Accuracy after round {r+1}: {test_acc*100:.2f}%")
+# =====================================
+# Cell 7 — Build Federation & Run Training (논문 구조 기반)
+# =====================================
+
+def build_federation():
+    # 1) 클라이언트 인덱스 분할 (IID)
+    client_indices_list = iid_client_split(train_subset, NUM_CLIENTS)
+
+    # 2) 글로벌 모델 생성 + layer chunk 계산
+    global_model = create_vgg19_cifar10().to(DEVICE)
+    layer_chunks = get_layer_chunks(global_model, NUM_CHUNKS)
+
+    # 3) 공격자 클라이언트 선정
+    num_attackers = int(NUM_CLIENTS * ATTACK_RATIO)
+    attacker_ids = set(random.sample(range(NUM_CLIENTS), num_attackers)) if num_attackers > 0 else set()
+    print("Attackers:", sorted(attacker_ids))
+
+    all_chunk_ids = list(range(NUM_CHUNKS))
+    edge_servers: List[EdgeServer] = []
+
+    for e in range(NUM_EDGE_SERVERS):
+        edge_clients: List[Client] = []
+        for i in range(CLIENTS_PER_EDGE):
+            global_client_id = e * CLIENTS_PER_EDGE + i
+            is_attacker = global_client_id in attacker_ids
+            indices = client_indices_list[global_client_id]
+
+            # 각 클라이언트는 여러 chunk를, 각 chunk는 여러 클라이언트에 의해 업데이트되도록
+            client_chunk_ids = random.sample(all_chunk_ids, k=min(CHUNKS_PER_CLIENT, NUM_CHUNKS))
+
+            client = Client(
+                client_id=global_client_id,
+                dataset=train_subset,
+                indices=indices,
+                layer_chunks=layer_chunks,
+                chunk_ids=client_chunk_ids,
+                is_attacker=is_attacker
+            )
+            edge_clients.append(client)
+
+        edge_server = EdgeServer(
+            edge_id=e,
+            clients=edge_clients,
+            val_dataset=val_subset,
+        )
+        edge_servers.append(edge_server)
+
+    return global_model, edge_servers
+
+
+def run_r_fedlayer_training():
+    global_model, edge_servers = build_federation()
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    cloud = CloudServer(global_model=global_model, edge_servers=edge_servers)
+    cloud.train(num_rounds=EPOCHS, test_loader=test_loader)
+
+    return cloud
+
+
+# =====================================
+# 실제 학습 실행
+# =====================================
+cloud_server = run_r_fedlayer_training()
+# 최종 글로벌 모델: cloud_server.global_model
