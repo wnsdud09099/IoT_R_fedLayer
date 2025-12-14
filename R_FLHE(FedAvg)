@@ -1,0 +1,385 @@
+# =====================================
+# Cell 1 — Imports & Global Config (코랩용, FedAvg + 2번 R-FedLayer 공격 방식)
+# =====================================
+import os
+import copy
+import random
+from typing import List, Dict, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms, models
+from torchvision.models import VGG19_Weights
+from tqdm.auto import tqdm
+
+# -----------------------------
+# Device (GPU / CPU)
+# -----------------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", DEVICE)
+
+# -----------------------------
+# Seed (재현성)
+# -----------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# -----------------------------
+# Dataset root (코랩 로컬 경로)
+# -----------------------------
+DATA_ROOT = "./data"
+
+# -----------------------------
+# ImageNet 정규화 값 (전이 학습 기준) — 여기선 raw 사용이라 직접 쓰진 않음
+# -----------------------------
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+# -----------------------------
+# Federated Learning Settings (FedAvg)
+# -----------------------------
+NUM_EDGE_SERVERS = 5       # 엣지 서버 수 (2, 3, 4, 5 등으로 바꿔가며 실험)
+CLIENTS_PER_EDGE = 5       # 엣지당 클라이언트 수
+NUM_CLIENTS = NUM_EDGE_SERVERS * CLIENTS_PER_EDGE  # 전체 클라이언트 수
+
+CLIENT_FRAC = 1.0          # 매 라운드 참여 비율 (1.0이면 전 클라이언트 참여)
+EPOCHS = 10                # Global rounds
+CLIENT_LOCAL_EPOCHS = 3    # 각 클라이언트 로컬 학습 에폭 수
+BATCH_SIZE = 10
+LR = 0.0025
+MOMENTUM = 0.9
+
+# -----------------------------
+# Attack settings (2번 R-FedLayer 방식: 한 엣지만 benign, 나머지는 모두 공격자)
+# -----------------------------
+ATTACK_ALPHA = 1.5         # 비표적 모델 중독 강도
+# =====================================
+# Cell 2 — CIFAR-10 Load & Split (raw 버전)
+# =====================================
+
+# ----- CIFAR-10 데이터셋 준비 (정규화/증강 X, raw tensor) -----
+def get_cifar10_datasets_raw():
+    train_transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train_dataset = datasets.CIFAR10(
+        root=DATA_ROOT,
+        train=True,
+        download=True,
+        transform=train_transform,
+    )
+    test_dataset = datasets.CIFAR10(
+        root=DATA_ROOT,
+        train=False,
+        download=True,
+        transform=test_transform,
+    )
+    return train_dataset, test_dataset
+
+
+def iid_client_split(dataset, num_clients: int) -> List[List[int]]:
+    """가장 단순한 IID 분할: 인덱스를 무작위로 섞어서 num_clients개로 균등 분할."""
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    split_size = len(indices) // num_clients
+    client_indices = [
+        indices[i * split_size:(i + 1) * split_size] for i in range(num_clients)
+    ]
+    return client_indices
+
+
+# ----- 데이터 로드 -----
+train_dataset_full, test_dataset = get_cifar10_datasets_raw()
+print("Train size (full):", len(train_dataset_full), "Test size:", len(test_dataset))
+
+# ----- Train / Val 분할 (논문 명시: 50,000 중 10,000개를 검증용으로 사용) -----
+num_train = 40000  # 50000 - 10000
+num_val = 10000    # 논문 명시 검증 데이터 크기
+train_subset, val_subset = torch.utils.data.random_split(
+    train_dataset_full,
+    [num_train, num_val],
+    generator=torch.Generator().manual_seed(SEED)
+)
+print("Train subset:", len(train_subset), "Val subset:", len(val_subset))
+# =====================================
+# Cell 3 — VGG19 Model (CIFAR-10용) + Poison 함수
+# =====================================
+def create_vgg19_cifar10(num_classes: int = 10) -> nn.Module:
+    """
+    VGG19를 CIFAR-10(32x32)용으로 수정한 모델.
+    - ImageNet 사전학습 가중치 사용
+    - 첫 MaxPool 제거 + AdaptiveAvgPool(1,1)
+    - classifier는 입력 512 → CIFAR-10 출력 10
+    - feature extractor는 freeze, classifier만 학습
+    """
+    try:
+        model = models.vgg19(weights=VGG19_Weights.IMAGENET1K_V1)
+        print("[VGG19] Loaded ImageNet pretrained weights.")
+    except Exception as e:
+        print("[VGG19] WARNING: Pretrained weights not available. Using random init.", e)
+        model = models.vgg19(weights=None)
+
+    # 1) 첫 번째 MaxPool 제거 (32x32 대응)
+    features_list = list(model.features.children())
+    # VGG19 구조에서 4번째 인덱스가 MaxPool2d
+    del features_list[4]
+    model.features = nn.Sequential(*features_list)
+
+    # 2) AdaptiveAvgPool(1,1)로 feature dim = 512 고정
+    model.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+
+    # 3) classifier 재구성 (입력 512)
+    model.classifier = nn.Sequential(
+        nn.Flatten(),               # (N, 512, 1, 1) -> (N, 512)
+        nn.Linear(512, 512),
+        nn.ReLU(True),
+        nn.Dropout(),
+        nn.Linear(512, 512),
+        nn.ReLU(True),
+        nn.Dropout(),
+        nn.Linear(512, num_classes),
+    )
+
+    # 4) feature extractor는 고정, classifier만 학습
+    for p in model.features.parameters():
+        p.requires_grad = False
+
+    # optimizer에서 쓰기 쉽도록 trainable param 리스트 저장
+    model.trainable_params = [p for p in model.parameters() if p.requires_grad]
+
+    return model
+
+
+def create_poisoned_state_from_global(
+    global_state: Dict[str, torch.Tensor],
+    local_state: Dict[str, torch.Tensor],
+    alpha: float = 3.0,
+) -> Dict[str, torch.Tensor]:
+    """
+    비표적 모델 중독 공격용:
+    - global_state: 라운드 시작 시 글로벌 모델 파라미터
+    - local_state:  클라이언트 로컬 학습 후 파라미터
+    - alpha:        공격 강도 (1.0 이상)
+
+    w_poison = w_global - alpha * (w_local - w_global)
+    """
+    poisoned_state: Dict[str, torch.Tensor] = {}
+
+    for k in global_state.keys():
+        g_param = global_state[k]
+        l_param = local_state[k]
+        poisoned_state[k] = g_param - alpha * (l_param - g_param)
+
+    return poisoned_state
+# =====================================
+# Cell 4 — Client (FedAvg용, 공격만 2번 방식)
+# =====================================
+class Client:
+    def __init__(self, client_id: int, dataset, indices: List[int], is_attacker: bool = False):
+        self.id = client_id
+        self.dataset = Subset(dataset, indices)
+        self.dataloader = DataLoader(self.dataset, batch_size=BATCH_SIZE, shuffle=True)
+        self.is_attacker = is_attacker
+
+    @property
+    def num_samples(self) -> int:
+        return len(self.dataset)
+
+    def local_train(self, global_model: nn.Module) -> Tuple[Dict[str, torch.Tensor], int]:
+        """
+        FedAvg의 ClientUpdate(k, w)
+        - 서버의 글로벌 모델 w_t로 초기화
+        - 로컬 데이터로 CLIENT_LOCAL_EPOCHS 만큼 SGD 학습
+        - 공격자인 경우: 비표적 모델 중독 포이즈닝 후 state 전송
+        - 반환: (업데이트된 state_dict, 데이터 샘플 수 n_k)
+        """
+        # 글로벌 모델 복제
+        model = copy.deepcopy(global_model).to(DEVICE)
+        model.train()
+
+        # (혹시 있을지도 모를 BatchNorm은 통계 고정)
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.SGD(model.trainable_params, lr=LR, momentum=MOMENTUM)
+
+        # 공격 실험용: 초기 상태 저장
+        initial_state = copy.deepcopy(model.state_dict())
+
+        # ----- 로컬 학습 -----
+        for epoch in range(CLIENT_LOCAL_EPOCHS):
+            epoch_bar = tqdm(
+                self.dataloader,
+                desc=f"Client {self.id} Epoch {epoch+1}/{CLIENT_LOCAL_EPOCHS}",
+                leave=False,
+            )
+            for images, labels in epoch_bar:
+                images, labels = images.to(DEVICE), labels.to(DEVICE)
+
+                optimizer.zero_grad()
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                optimizer.step()
+
+        local_state = model.state_dict()
+
+        # ----- 공격자 / 정상 클라이언트 분기 -----
+        if self.is_attacker:
+            # 비표적 모델 중독 공격
+            poisoned_state = create_poisoned_state_from_global(
+                global_state=initial_state,
+                local_state=local_state,
+                alpha=ATTACK_ALPHA,
+            )
+            used_state = poisoned_state
+        else:
+            used_state = local_state
+
+        return used_state, self.num_samples
+# =====================================
+# Cell 5 — FedAvg Aggregation & 평가 함수
+# =====================================
+def fedavg_aggregate(
+    global_state: Dict[str, torch.Tensor],
+    client_states: List[Dict[str, torch.Tensor]],
+    client_sizes: List[int],
+) -> Dict[str, torch.Tensor]:
+    """
+    FedAvg 서버 측 업데이트:
+    w_{t+1} = sum_k (n_k / N) * w_k
+    """
+    new_state = {}
+    total_samples = sum(client_sizes)
+
+    # 모든 키에 대해 0 텐서로 초기화
+    for k in global_state.keys():
+        new_state[k] = torch.zeros_like(global_state[k])
+
+    # 가중 평균
+    for state, n_k in zip(client_states, client_sizes):
+        weight = n_k / total_samples
+        for k in new_state.keys():
+            new_state[k] += state[k] * weight
+
+    return new_state
+
+
+def evaluate_accuracy(model: nn.Module, dataloader, device) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for images, labels in dataloader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+    return correct / max(total, 1)
+# =====================================
+# Cell 6 — FedAvg Server
+# =====================================
+class FedAvgServer:
+    def __init__(self, global_model: nn.Module, clients: List[Client], test_loader):
+        self.global_model = global_model
+        self.clients = clients
+        self.test_loader = test_loader
+
+    def select_clients(self) -> List[Client]:
+        """매 라운드마다 무작위로 m = max(C·K, 1)명 선택."""
+        m = max(int(CLIENT_FRAC * len(self.clients)), 1)
+        return random.sample(self.clients, m)
+
+    def train(self, num_rounds: int):
+        for r in range(num_rounds):
+            print(f"\n[Round {r+1}/{num_rounds}]")
+
+            # ----- 클라이언트 선택 -----
+            selected_clients = self.select_clients()
+            print("  Selected clients:", [c.id for c in selected_clients])
+
+            global_state = self.global_model.state_dict()
+            client_states = []
+            client_sizes = []
+
+            # ----- 각 클라이언트 로컬 학습 -----
+            for client in selected_clients:
+                updated_state, n_k = client.local_train(self.global_model)
+                client_states.append(updated_state)
+                client_sizes.append(n_k)
+
+            # ----- FedAvg 집계 -----
+            new_global_state = fedavg_aggregate(global_state, client_states, client_sizes)
+            self.global_model.load_state_dict(new_global_state)
+
+            # ----- 테스트 정확도 -----
+            test_acc = evaluate_accuracy(self.global_model, self.test_loader, DEVICE)
+            print(f"  Test Accuracy after round {r+1}: {test_acc * 100:.2f}%")
+# =====================================
+# Cell 7 — Federation 구성 & 학습 실행
+#         (공격자 배치만 2번 R-FedLayer 방식)
+# =====================================
+def build_fedavg_federation():
+    # 1) 클라이언트 인덱스 분할 (IID)
+    client_indices_list = iid_client_split(train_subset, NUM_CLIENTS)
+
+    # 2) 글로벌 모델 생성
+    global_model = create_vgg19_cifar10().to(DEVICE)
+
+    # 3) 공격자 선정 — 2번 R-FedLayer 방식
+    #    하나의 엣지만 benign, 나머지 엣지는 모든 클라이언트가 공격자
+    if NUM_EDGE_SERVERS <= 1:
+        benign_edge_id = 0
+    else:
+        benign_edge_id = 0  # 재현성을 위해 고정 (원하면 random.randint(...) 사용 가능)
+
+    attacker_ids = set()
+    for e in range(NUM_EDGE_SERVERS):
+        for i in range(CLIENTS_PER_EDGE):
+            global_client_id = e * CLIENTS_PER_EDGE + i
+            # benign_edge_id만 정상, 나머지 엣지에 속한 클라는 전부 공격자
+            if e != benign_edge_id:
+                attacker_ids.add(global_client_id)
+
+    print(f"Benign edge server (no attack): {benign_edge_id}")
+    print("Attackers (client ids):", sorted(attacker_ids))
+
+    # 4) 클라이언트 객체 생성
+    clients: List[Client] = []
+    for cid in range(NUM_CLIENTS):
+        indices = client_indices_list[cid]
+        is_attacker = cid in attacker_ids
+        client = Client(
+            client_id=cid,
+            dataset=train_subset,
+            indices=indices,
+            is_attacker=is_attacker,
+        )
+        clients.append(client)
+
+    # 5) 테스트 로더
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    # 6) FedAvg 서버 객체
+    server = FedAvgServer(global_model=global_model, clients=clients, test_loader=test_loader)
+    return server
+
+
+# ----- 실제 학습 실행 -----
+fedavg_server = build_fedavg_federation()
+fedavg_server.train(num_rounds=EPOCHS)  # EPOCHS = global rounds
